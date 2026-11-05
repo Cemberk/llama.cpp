@@ -2011,12 +2011,27 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     // shared across all sequences
     common_ngram_simple_config config;
 
+    // drafting pays only when the target accepts enough of it: after a run of rejected drafts, skip drafting for
+    // a while, longer after each failed retry, so text that does not repeat the context costs no verification
+    struct gate {
+        uint16_t n_draft_last = 0;     // tokens of the last draft, 0 if it was skipped or empty
+        float    acceptance   = 1.0f;  // moving average of the accepted share of drafts
+        int32_t  skip         = 0;     // drafts still to skip
+        int32_t  backoff      = 0;     // length of the last pause
+    };
+    static constexpr float   gate_min_acceptance = 0.15f;
+    static constexpr int32_t gate_first_pause    = 8;
+    static constexpr int32_t gate_max_pause      = 256;
+
+    std::vector<gate> gates;
+
     common_speculative_impl_ngram_simple(
             const common_params_speculative & params, uint32_t n_seq,
             common_ngram_simple_config config)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, n_seq, params.ngram_simple.size_m)
         , params(params.ngram_simple)
         , config(config)
+        , gates(n_seq)
     {
         SPC_TRC("%s", "adding speculative implementation 'ngram-simple'\n");
         SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d\n",
@@ -2041,12 +2056,38 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
                 continue;
             }
 
+            gate & g = gates[seq_id];
+            if (g.skip > 0) {
+                g.skip--;
+                g.n_draft_last = 0;
+                dp.result->clear();
+                continue;
+            }
+
             *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
+            g.n_draft_last = (uint16_t) dp.result->size();
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || (size_t) seq_id >= gates.size()) {
+            return;
+        }
+        gate & g = gates[seq_id];
+        if (g.n_draft_last == 0) {
+            return;
+        }
+        const float f_acc = std::min(1.0f, (float) n_accepted / (float) g.n_draft_last);
+        g.n_draft_last = 0;
+        g.acceptance = 0.8f*g.acceptance + 0.2f*f_acc;
+        if (f_acc >= 0.5f) {
+            g.backoff = 0;
+        } else if (g.acceptance < gate_min_acceptance) {
+            g.backoff    = g.backoff == 0 ? gate_first_pause : std::min(2*g.backoff, gate_max_pause);
+            g.skip       = g.backoff;
+            g.acceptance = 0.5f; // the retry after the pause gets a fair chance
+            SPC_TRC("ngram-simple: low acceptance on seq %d, not drafting for %d steps\n", seq_id, g.skip);
+        }
     }
 };
 
