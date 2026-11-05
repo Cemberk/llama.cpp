@@ -12,7 +12,8 @@ Policies:
   slru    the cache in src/llama-moe-cache.cpp: probation and protected halves
   lru     plain least recently used
   lfu     least frequently used, with counts that decay every step
-  warm    slru, with the experts a profile trace used most pinned first
+  warm    slru, preloaded with the experts a profile trace used most, as
+          --moe-cache-profile does (up to half the slots)
   belady  evicts the expert used furthest in the future: the best possible
 
   python moe_cache_sim.py trace.txt --slots 2048
@@ -79,12 +80,19 @@ class SLRU(Policy):
 
     name = "slru"
 
-    def __init__(self, slots: int, pinned: frozenset = frozenset()):
+    def __init__(
+        self,
+        slots: int,
+        preload: frozenset = frozenset(),
+        pinned: frozenset = frozenset(),
+    ):
         super().__init__(slots)
+        # --moe-cache-profile preloads the most used experts as protected
+        # slots, which later steps may still evict.
         self.pinned = pinned
         self.probation = collections.OrderedDict()
         self.protected = collections.OrderedDict()
-        for key in pinned:
+        for key in sorted(pinned | preload):
             self.protected[key] = None
 
     def _victim(self, current: set):
@@ -148,27 +156,29 @@ class LRU(Policy):
 
 
 class LFU(Policy):
-    """Evicts the cached expert with the lowest decayed count."""
+    """Evicts the cached expert with the lowest decayed count, as
+    --moe-cache-policy lfu does: a step first counts its experts, and every
+    `decay_every` steps (layer lookups) halve all counts."""
 
     name = "lfu"
 
-    def __init__(self, slots: int, decay: float = 0.999):
+    def __init__(self, slots: int, decay_every: int = 4096):
         super().__init__(slots)
-        self.decay = decay
-        self.scale = 1.0  # counts are stored divided by decay**t
+        self.decay_every = decay_every
+        self.steps = 0
         self.score = collections.defaultdict(float)
         self.cached = set()
 
     def access(self, keys: list, index: int) -> int:
-        self.scale /= self.decay
-        if self.scale > 1e100:
+        for key in keys:
+            self.score[key] += 1.0
+        self.steps += 1
+        if self.steps % self.decay_every == 0:
             for key in self.score:
-                self.score[key] /= self.scale
-            self.scale = 1.0
+                self.score[key] *= 0.5
         current = set(keys)
         misses = 0
         for key in keys:
-            self.score[key] += self.scale
             if key in self.cached:
                 continue
             misses += 1
@@ -296,8 +306,8 @@ def main(argv: list) -> int:
     size.add_argument("--slots", type=int, help="experts the cache holds")
     size.add_argument("--fraction", type=float, help="share of the traced layers' experts the cache holds")
     parser.add_argument("--experts", type=int, help="experts per layer (default: the largest id + 1)")
-    parser.add_argument("--profile", help="an earlier trace whose most used experts the warm policy pins")
-    parser.add_argument("--pin-share", type=float, default=0.5, help="share of the slots the warm policy pins (default 0.5)")
+    parser.add_argument("--profile", help="an earlier trace whose most used experts the warm policy preloads")
+    parser.add_argument("--pin-share", type=float, default=0.5, help="share of the slots the warm policy preloads (default 0.5, as the engine)")
     parser.add_argument("--expert-bytes", type=int, help="bytes of one expert (all tensors), to report the uploads")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
@@ -323,7 +333,7 @@ def main(argv: list) -> int:
     trace_keys = [unique(step) for step in steps]
     policies = [SLRU(slots), LRU(slots), LFU(slots)]
     if args.profile:
-        policies.append(SLRU(slots, profile_pins(args.profile, slots, args.pin_share)))
+        policies.append(SLRU(slots, preload=profile_pins(args.profile, slots, args.pin_share)))
         policies[-1].name = "warm"
     policies.append(Belady(slots, trace_keys))
 

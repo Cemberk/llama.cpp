@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "llama.h"
 
 #include <map>
 #include <string>
@@ -9,13 +10,19 @@
 
 struct llama_model;
 
+struct llama_moe_cache_options {
+    size_t size = 0;      // device bytes for the cache
+    std::string trace;    // file the experts selected in cached layers are appended to, empty = off
+    std::string profile;  // file of expert usage, read at start (warm start) and written at the end, empty = off
+    enum llama_moe_cache_policy policy = LLAMA_MOE_CACHE_POLICY_SLRU;
+};
+
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    // trace: file the experts selected in cached layers are appended to, empty = off
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const std::string & trace = "");
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_options & options);
     ~llama_moe_cache();
 
     // the device that caches layer il

@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +36,12 @@ struct moe_cache_slru {
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
 
+    // decayed selection counts by key (il*n_expert + expert): the LFU policy evicts the lowest, the profile saves them
+    bool lfu = false;
+    std::vector<float> score;
+    uint32_t n_plans = 0;
+    static constexpr uint32_t decay_every = 4096; // layer lookups between halvings of the scores
+
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
@@ -49,6 +57,7 @@ struct moe_cache_slru {
         tail[0] = n_slots - 1;
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
+        score.assign((size_t) n_layer*n_expert, 0.0f);
     }
 
     // move slot s to the most recently used end of a segment
@@ -88,6 +97,26 @@ struct moe_cache_slru {
     }
 
     int32_t victim(int32_t il) const {
+        if (lfu) {
+            int32_t best = -1;
+            for (int32_t s = 0; s < n_slots; ++s) {
+                const int32_t key = key_of[s];
+                if (key < 0) {
+                    return s;
+                }
+                // keep every expert selected by this request, including earlier fills
+                if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                    continue;
+                }
+                if (best < 0 || score[key] < score[key_of[best]]) {
+                    best = s;
+                }
+            }
+            if (best < 0) {
+                GGML_ABORT("no LFU victim");
+            }
+            return best;
+        }
         for (int segment = 0; segment < 2; ++segment) {
             for (int32_t s = head[segment]; s >= 0; s = next[s]) {
                 const int32_t key = key_of[s];
@@ -104,6 +133,47 @@ struct moe_cache_slru {
         int32_t expert;
         int32_t slot;
     };
+
+    struct warm_fill {
+        int32_t il;
+        int32_t expert;
+        int32_t slot;
+    };
+
+    // give the empty cache the highest scoring experts of `layers`, at most n_max, as protected slots
+    std::vector<warm_fill> warm(const std::vector<int32_t> & layers, int32_t n_max) {
+        std::vector<std::pair<float, int32_t>> ranked; // score, key
+        for (int32_t il : layers) {
+            for (int32_t e = 0; e < n_expert; ++e) {
+                const float x = score[(size_t) il*n_expert + e];
+                if (x > 0.0f) {
+                    ranked.emplace_back(x, il*n_expert + e);
+                }
+            }
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        if (ranked.size() > (size_t) std::min(n_max, n_slots)) {
+            ranked.resize(std::min(n_max, n_slots));
+        }
+        // consecutive experts of a layer in consecutive slots, so the uploads can be merged
+        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+
+        std::vector<warm_fill> fills;
+        int32_t s = 0;
+        for (const auto & r : ranked) {
+            const int32_t il = r.second / n_expert;
+            const int32_t e  = r.second % n_expert;
+            if (slot_map[il] == nullptr) {
+                continue;
+            }
+            key_of[s] = r.second;
+            slot_map[il][e] = s;
+            move(s, true);
+            fills.push_back({ il, e, s });
+            s++;
+        }
+        return fills;
+    }
 
     // give a slot to each expert selected by ids in layer il, evicting from probation first
     // returns false if the ids select more distinct experts than there are slots
@@ -125,6 +195,15 @@ struct moe_cache_slru {
         }
         if (uniq.size() > (size_t) n_slots) {
             return false;
+        }
+
+        for (int32_t e : uniq) {
+            score[(size_t) il*n_expert + e] += 1.0f;
+        }
+        if (++n_plans % decay_every == 0) {
+            for (float & x : score) {
+                x *= 0.5f;
+            }
         }
 
         int32_t * slots = slot_map[il];
@@ -249,6 +328,9 @@ struct llama_moe_cache::impl {
     // the experts selected in cached layers, one line per layer and ubatch: "il n_tokens id..."
     FILE * trace = nullptr;
 
+    // expert usage, read at start and written at the end
+    std::string profile;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -257,8 +339,13 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const std::string & trace_path) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_options & options) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        const size_t size = options.size;
+        const std::string & trace_path = options.trace;
+        if (!no_alloc) {
+            profile = options.profile;
+        }
         if (!trace_path.empty() && !no_alloc) {
             trace = std::fopen(trace_path.c_str(), "a");
             if (trace == nullptr) {
@@ -369,6 +456,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+            g.slru.lfu = options.policy == LLAMA_MOE_CACHE_POLICY_LFU;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
@@ -454,6 +542,11 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (!profile.empty()) {
+            load_profile();
+            warm_start();
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -486,6 +579,95 @@ struct llama_moe_cache::impl {
         log_stats();
         if (trace != nullptr) {
             std::fclose(trace);
+        }
+        if (!profile.empty()) {
+            save_profile();
+        }
+    }
+
+    // "il expert score" lines; experts of layers or groups that are not cached are skipped
+    void load_profile() {
+        std::ifstream in(profile);
+        if (!in) {
+            return; // the first session of a profile
+        }
+        size_t n = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream fields(line);
+            int32_t il = -1;
+            int32_t e  = -1;
+            float   x  = 0.0f;
+            if (!(fields >> il >> e >> x) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || x <= 0.0f) {
+                continue;
+            }
+            moe_cache_slru & slru = groups[layers[il].ig].slru;
+            if (groups[layers[il].ig].n_slots == 0 || e < 0 || e >= slru.n_expert) {
+                continue;
+            }
+            slru.score[(size_t) il*slru.n_expert + e] = x;
+            n++;
+        }
+        LLAMA_LOG_INFO("%s: read the usage of %zu experts from %s\n", __func__, n, profile.c_str());
+    }
+
+    // upload the most used experts of the profile, up to half of each group's slots
+    void warm_start() {
+        size_t n = 0;
+        size_t bytes = 0;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            for (const auto & f : g.slru.warm(g.layers, g.n_slots/2)) {
+                const layer & l = layers[f.il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + f.expert*expert_size, f.slot*expert_size, expert_size);
+                    bytes += expert_size;
+                }
+                n++;
+            }
+        }
+        if (n > 0) {
+            LLAMA_LOG_INFO("%s: warm start with %zu experts, %.2f MiB\n", __func__, n, bytes/1024.0/1024.0);
+        }
+    }
+
+    // written to a temporary file first, so a crash never leaves half a profile
+    void save_profile() const {
+        const std::string tmp = profile + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            if (!out) {
+                LLAMA_LOG_WARN("%s: cannot write the MoE cache profile %s\n", __func__, tmp.c_str());
+                return;
+            }
+            out << "# llama.cpp MoE cache profile: layer expert score\n";
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (layers[il].ig < 0 || groups[layers[il].ig].n_slots == 0) {
+                    continue;
+                }
+                const moe_cache_slru & slru = groups[layers[il].ig].slru;
+                for (int32_t e = 0; e < slru.n_expert; ++e) {
+                    const float x = slru.score[il*slru.n_expert + e];
+                    if (x >= 0.01f) {
+                        out << il << ' ' << e << ' ' << x << '\n';
+                    }
+                }
+            }
+            if (!out) {
+                LLAMA_LOG_WARN("%s: cannot write the MoE cache profile %s\n", __func__, tmp.c_str());
+                return;
+            }
+        }
+        std::remove(profile.c_str()); // rename does not replace a file on Windows
+        if (std::rename(tmp.c_str(), profile.c_str()) != 0) {
+            LLAMA_LOG_WARN("%s: cannot replace the MoE cache profile %s\n", __func__, profile.c_str());
         }
     }
 
@@ -637,8 +819,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const std::string & trace) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, trace)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_options & options) :
+    pimpl(new impl(model, no_alloc, backends, bufts, options)) {
 }
 
 void llama_moe_cache::get_stats(llama_moe_cache_stats * out) const {

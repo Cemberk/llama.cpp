@@ -393,6 +393,8 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.moe_cache_trace = params.moe_cache_trace ? params.moe_cache_trace : "";
+    cparams.moe_cache_profile = params.moe_cache_profile ? params.moe_cache_profile : "";
+    cparams.moe_cache_policy = params.moe_cache_policy;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -613,7 +615,12 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_trace);
+            llama_moe_cache_options options;
+            options.size    = cparams.moe_cache_size;
+            options.trace   = cparams.moe_cache_trace;
+            options.profile = cparams.moe_cache_profile;
+            options.policy  = cparams.moe_cache_policy;
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, options);
         }
 
         sched_reserve();
@@ -4283,6 +4290,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_trace             =*/ nullptr,
+        /*.moe_cache_profile           =*/ nullptr,
+        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_SLRU,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

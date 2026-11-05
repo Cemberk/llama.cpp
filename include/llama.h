@@ -364,6 +364,12 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    // how the MoE cache (see moe_cache_size) picks the expert to evict [EXPERIMENTAL]
+    enum llama_moe_cache_policy {
+        LLAMA_MOE_CACHE_POLICY_SLRU = 0, // segmented least recently used
+        LLAMA_MOE_CACHE_POLICY_LFU  = 1, // least frequently used, with decaying counts
+    };
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
@@ -399,6 +405,8 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         const char * moe_cache_trace; // file the experts selected in cached layers are appended to, one line per layer and ubatch, NULL = off [EXPERIMENTAL]
+        const char * moe_cache_profile; // file of expert usage: read at start to fill the cache with the most used experts, written back at the end, NULL = off [EXPERIMENTAL]
+        enum llama_moe_cache_policy moe_cache_policy; // [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

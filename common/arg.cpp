@@ -2742,6 +2742,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-cache-profile"}, "FILE",
+        "MoE cache expert usage: read at start to fill the cache with the most used experts (up to half of it), written back at the end. Keep one per model and project (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "{slru,lfu}",
+        "which expert the MoE cache evicts: slru, the least recently used, or lfu, the least used with counts that decay (default: slru)",
+        [](common_params & params, const std::string & value) {
+            if (value == "slru") {
+                params.moe_cache_policy = LLAMA_MOE_CACHE_POLICY_SLRU;
+            } else if (value == "lfu") {
+                params.moe_cache_policy = LLAMA_MOE_CACHE_POLICY_LFU;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -599,6 +599,8 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     std::string moe_cache_trace; // file the experts selected in cached layers are appended to, empty = off
+    std::string moe_cache_profile; // file of expert usage, read at start and written at the end, empty = off
+    enum llama_moe_cache_policy moe_cache_policy = LLAMA_MOE_CACHE_POLICY_SLRU;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
