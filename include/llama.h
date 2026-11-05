@@ -398,6 +398,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const char * moe_cache_trace; // file the experts selected in cached layers are appended to, one line per layer and ubatch, NULL = off [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -576,6 +577,23 @@ extern "C" {
     // NOTE: After creating a llama_context, it is recommended to query the actual values using these functions
     //       In some cases the requested values via llama_context_params may differ from the actual values used by the context
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+    // counters of the MoE cache (see moe_cache_size), since the context was created
+    struct llama_moe_cache_stats {
+        uint64_t n_hit;          // ubatches of up to 8 tokens: selected experts found in the cache
+        uint64_t n_miss;         // ubatches of up to 8 tokens: selected experts uploaded to the cache
+        uint64_t n_bytes;        // ubatches of up to 8 tokens: bytes uploaded
+        uint64_t n_hit_large;    // larger ubatches
+        uint64_t n_miss_large;
+        uint64_t n_bytes_large;
+        uint64_t n_copied;       // experts read from the cache by large batches
+        uint64_t n_bytes_copied;
+        int32_t  n_slots;        // experts the cache holds, all devices together
+        int32_t  n_layers;       // layers it caches
+    };
+
+    // returns false when the context has no MoE cache [EXPERIMENTAL]
+    LLAMA_API bool llama_moe_cache_get_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * stats);
+
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);

@@ -1610,6 +1610,21 @@ std::string server_task_result_metrics::to_metrics() {
         },
     };
 
+    std::vector<metric_item> moe_counters;
+    if (has_moe_cache) {
+        moe_counters = {
+            { "moe_cache_hits_total",          "MoE cache: selected experts found in the cache, ubatches of up to 8 tokens", (double) moe_cache.n_hit },
+            { "moe_cache_misses_total",        "MoE cache: selected experts uploaded, ubatches of up to 8 tokens",           (double) moe_cache.n_miss },
+            { "moe_cache_bytes_total",         "MoE cache: bytes uploaded, ubatches of up to 8 tokens",                      (double) moe_cache.n_bytes },
+            { "moe_cache_hits_large_total",    "MoE cache: selected experts found in the cache, larger ubatches",            (double) moe_cache.n_hit_large },
+            { "moe_cache_misses_large_total",  "MoE cache: selected experts uploaded, larger ubatches",                      (double) moe_cache.n_miss_large },
+            { "moe_cache_bytes_large_total",   "MoE cache: bytes uploaded, larger ubatches",                                 (double) moe_cache.n_bytes_large },
+            { "moe_cache_copied_total",        "MoE cache: experts read from the cache by large batches",                    (double) moe_cache.n_copied },
+            { "moe_cache_slots",               "MoE cache: experts the cache holds",                                         (double) moe_cache.n_slots },
+            { "moe_cache_layers",              "MoE cache: layers it caches",                                                (double) moe_cache.n_layers },
+        };
+    }
+
     const std::vector<metric_item> gauges = {
         {
             "prompt_tokens_seconds",
@@ -1646,6 +1661,7 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+    add_items("counter", moe_counters);
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {

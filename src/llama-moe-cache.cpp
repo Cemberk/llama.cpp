@@ -7,6 +7,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -245,6 +246,9 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
 
+    // the experts selected in cached layers, one line per layer and ubatch: "il n_tokens id..."
+    FILE * trace = nullptr;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -253,8 +257,14 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const std::string & trace_path) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        if (!trace_path.empty() && !no_alloc) {
+            trace = std::fopen(trace_path.c_str(), "a");
+            if (trace == nullptr) {
+                LLAMA_LOG_WARN("%s: cannot open the MoE cache trace %s\n", __func__, trace_path.c_str());
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -474,6 +484,9 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (trace != nullptr) {
+            std::fclose(trace);
+        }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -588,6 +601,14 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (trace != nullptr) {
+            std::fprintf(trace, "%d %lld", il, (long long) sel->ne[1]);
+            for (int32_t id : ids) {
+                std::fprintf(trace, " %d", id);
+            }
+            std::fputc('\n', trace);
+        }
+
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
@@ -616,8 +637,27 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const std::string & trace) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, trace)) {
+}
+
+void llama_moe_cache::get_stats(llama_moe_cache_stats * out) const {
+    const impl & p = *pimpl;
+    *out = {};
+    out->n_hit          = p.stats_small.hits;
+    out->n_miss         = p.stats_small.misses;
+    out->n_bytes        = p.stats_small.bytes;
+    out->n_hit_large    = p.stats_large.hits;
+    out->n_miss_large   = p.stats_large.misses;
+    out->n_bytes_large  = p.stats_large.bytes;
+    out->n_copied       = p.stats_copy.hits;
+    out->n_bytes_copied = p.stats_copy.bytes;
+    for (const auto & g : p.groups) {
+        if (g.n_slots > 0) {
+            out->n_slots  += g.n_slots;
+            out->n_layers += (int32_t) g.layers.size();
+        }
+    }
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

@@ -67,6 +67,9 @@ struct llama_context {
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
+
+    // false when there is no MoE cache
+    bool moe_cache_stats(llama_moe_cache_stats * stats) const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;

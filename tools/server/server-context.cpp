@@ -3194,6 +3194,7 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    res->has_moe_cache       = llama_moe_cache_get_stats(ctx_tgt, &res->moe_cache);
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

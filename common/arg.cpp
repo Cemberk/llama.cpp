@@ -2735,6 +2735,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-trace"}, "FILE",
+        "append the experts selected in the layers the MoE cache serves to FILE, one line per layer and ubatch: \"layer n_tokens expert...\" (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_trace = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

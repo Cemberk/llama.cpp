@@ -615,6 +615,10 @@ struct server_task_result_metrics : server_task_result {
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
 
+    // counters of the MoE cache, when the target context has one
+    bool has_moe_cache = false;
+    llama_moe_cache_stats moe_cache = {};
+
     server_metrics metrics;
 
     virtual json to_json() override;
