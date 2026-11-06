@@ -368,6 +368,7 @@ extern "C" {
     enum llama_moe_cache_policy {
         LLAMA_MOE_CACHE_POLICY_SLRU = 0, // segmented least recently used
         LLAMA_MOE_CACHE_POLICY_LFU  = 1, // least frequently used, with decaying counts
+        LLAMA_MOE_CACHE_POLICY_NEXT = 2, // expected next use furthest away: layer order in the pass, then the decaying counts
     };
 
     struct llama_context_params {

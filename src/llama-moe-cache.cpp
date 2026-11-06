@@ -7,6 +7,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -37,7 +38,42 @@ struct moe_cache_slru {
     std::vector<int32_t> uniq;
 
     // decayed selection counts by key (il*n_expert + expert): the LFU policy evicts the lowest, the profile saves them
-    bool lfu = false;
+    enum llama_moe_cache_policy policy = LLAMA_MOE_CACHE_POLICY_SLRU;
+
+    // the next policy: each cached layer's place in the pass, and the tokens a count covers
+    std::vector<int32_t> layer_pos; // [n_layer] -1 if the layer is not in this group
+    int32_t n_pass_layers = 0;
+    float   window        = 1.0f;
+
+    void set_layers(const std::vector<int32_t> & layers) {
+        std::vector<int32_t> sorted = layers;
+        std::sort(sorted.begin(), sorted.end());
+        std::fill(layer_pos.begin(), layer_pos.end(), -1);
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            if (sorted[i] >= 0 && sorted[i] < (int32_t) layer_pos.size()) {
+                layer_pos[sorted[i]] = (int32_t) i;
+            }
+        }
+        n_pass_layers = std::max<int32_t>(1, (int32_t) sorted.size());
+        // counts halve every decay_every lookups, n_pass_layers per token: a count covers this many tokens
+        window = (float) decay_every / ((float) n_pass_layers * 0.6931472f);
+    }
+
+    // lookups until the expert of key is expected to be selected again, seen from layer il
+    float expected_next_use(int32_t key, int32_t il) const {
+        const int32_t kl  = key / n_expert;
+        const int32_t now = layer_pos[il] >= 0 ? layer_pos[il] : 0;
+        const int32_t at  = layer_pos[kl] >= 0 ? layer_pos[kl] : 0;
+        int32_t d = ((at - now) % n_pass_layers + n_pass_layers) % n_pass_layers;
+        if (d == 0) {
+            d = n_pass_layers; // the layer that runs now is next needed a full pass later
+        }
+        const float p = std::min(1.0f, score[key] / window);
+        if (p <= 0.0f) {
+            return INFINITY;
+        }
+        return (float) d + (float) n_pass_layers*(1.0f/p - 1.0f);
+    }
     std::vector<float> score;
     uint32_t n_plans = 0;
     static constexpr uint32_t decay_every = 4096; // layer lookups between halvings of the scores
@@ -58,6 +94,7 @@ struct moe_cache_slru {
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
         score.assign((size_t) n_layer*n_expert, 0.0f);
+        layer_pos.assign(n_layer, -1);
     }
 
     // move slot s to the most recently used end of a segment
@@ -97,7 +134,30 @@ struct moe_cache_slru {
     }
 
     int32_t victim(int32_t il) const {
-        if (lfu) {
+        if (policy == LLAMA_MOE_CACHE_POLICY_NEXT) {
+            int32_t best = -1;
+            float best_next = -1.0f;
+            for (int32_t s = 0; s < n_slots; ++s) {
+                const int32_t key = key_of[s];
+                if (key < 0) {
+                    return s;
+                }
+                // keep every expert selected by this request, including earlier fills
+                if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                    continue;
+                }
+                const float next_use = expected_next_use(key, il);
+                if (best < 0 || next_use > best_next) {
+                    best = s;
+                    best_next = next_use;
+                }
+            }
+            if (best < 0) {
+                GGML_ABORT("no victim for the next policy");
+            }
+            return best;
+        }
+        if (policy == LLAMA_MOE_CACHE_POLICY_LFU) {
             int32_t best = -1;
             for (int32_t s = 0; s < n_slots; ++s) {
                 const int32_t key = key_of[s];
@@ -521,7 +581,8 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
-            g.slru.lfu = options.policy == LLAMA_MOE_CACHE_POLICY_LFU;
+            g.slru.policy = options.policy;
+            g.slru.set_layers(g.layers);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(hybrid ? 2 : 1);
         }

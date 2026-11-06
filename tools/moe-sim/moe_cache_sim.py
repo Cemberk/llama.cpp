@@ -14,6 +14,9 @@ Policies:
   lfu     least frequently used, with counts that decay every step
   warm    slru, preloaded with the experts a profile trace used most, as
           --moe-cache-profile does (up to half the slots)
+  next    evicts the expert whose next use is expected furthest away: its
+          layer's distance in the pass, plus the tokens its count says it
+          sits out (after JITEngine's Flash-Next M2 engine)
   belady  evicts the expert used furthest in the future: the best possible
 
   python moe_cache_sim.py trace.txt --slots 2048
@@ -189,6 +192,59 @@ class LFU(Policy):
         return misses
 
 
+class NextUse(Policy):
+    """Evicts the expert whose next use is expected furthest away, as
+    --moe-cache-policy next does. A pass runs through the layers in order, so
+    an expert of layer l is next needed d lookups from now, d being the
+    distance from the current layer to l (a full pass for the layer that just
+    ran), plus a pass for each token it is expected to sit out. The chance a
+    token uses it, p, comes from the decayed count of the LFU policy: with
+    counts halved every `decay_every` lookups over n_layers layers, a count
+    covers about decay_every / (n_layers ln 2) tokens."""
+
+    name = "next"
+
+    def __init__(self, slots: int, layers: list, decay_every: int = 4096):
+        super().__init__(slots)
+        self.position = {layer: i for i, layer in enumerate(sorted(layers))}
+        self.n_layers = len(self.position)
+        self.decay_every = decay_every
+        self.window = decay_every / (self.n_layers * 0.6931471805599453)
+        self.steps = 0
+        self.score = collections.defaultdict(float)
+        self.cached = set()
+
+    def expected_next_use(self, key, layer_pos: int) -> float:
+        distance = (self.position[key[0]] - layer_pos) % self.n_layers or self.n_layers
+        p = min(1.0, self.score[key] / self.window)
+        if p <= 0.0:
+            return float("inf")
+        return distance + self.n_layers * (1.0 / p - 1.0)
+
+    def access(self, keys: list, index: int) -> int:
+        for key in keys:
+            self.score[key] += 1.0
+        self.steps += 1
+        if self.steps % self.decay_every == 0:
+            for key in self.score:
+                self.score[key] *= 0.5
+        current = set(keys)
+        layer_pos = self.position[keys[0][0]] if keys else 0
+        misses = 0
+        for key in keys:
+            if key in self.cached:
+                continue
+            misses += 1
+            if len(self.cached) >= self.slots:
+                victim = max(
+                    (k for k in self.cached if k not in current),
+                    key=lambda k: self.expected_next_use(k, layer_pos),
+                )
+                self.cached.remove(victim)
+            self.cached.add(key)
+        return misses
+
+
 class Belady(Policy):
     """Offline optimum: needs the whole trace up front."""
 
@@ -291,7 +347,7 @@ def self_test() -> None:
             cold = rng.sample(range(4, 64), 2)
             steps.append(Step(layer, 1, hot + cold))
     trace_keys = [unique(s) for s in steps]
-    results = {r.name: r for r in simulate(steps, [SLRU(16), LRU(16), LFU(16), Belady(16, trace_keys)])}
+    results = {r.name: r for r in simulate(steps, [SLRU(16), LRU(16), LFU(16), NextUse(16, [0, 1]), Belady(16, trace_keys)])}
     best = results["belady"].misses
     for name, r in results.items():
         assert r.misses >= best, (name, r.misses, best)
@@ -331,7 +387,7 @@ def main(argv: list) -> int:
         return 1
 
     trace_keys = [unique(step) for step in steps]
-    policies = [SLRU(slots), LRU(slots), LFU(slots)]
+    policies = [SLRU(slots), LRU(slots), LFU(slots), NextUse(slots, layers)]
     if args.profile:
         policies.append(SLRU(slots, preload=profile_pins(args.profile, slots, args.pin_share)))
         policies[-1].name = "warm"
