@@ -2655,12 +2655,19 @@ llm_graph_context::moe_cache_lookup llm_graph_context::build_moe_cache_lookup(
         }
         ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
-        // as the slot map: a host weight, copied with the copy callback, which reads the selected experts and fills it
+        // as the slot map: a host weight, copied with the copy callback, which fills it from what the cache holds
         ggml_tensor * rows = ggml_get_rows(ctx0, map, ids); // [3, n_expert_used*n_tokens]
         if (ggml_backend_supports_op(moe_cache->backend(il), rows)) {
             ggml_backend_sched_set_tensor_backend(sched, rows, moe_cache->backend(il));
             cb(rows, "ffn_moe_hybrid_map", il);
             ggml_build_forward_expand(gf, rows);
+
+            // the cache reads which experts were selected after the step (llama_moe_cache::observe), so no layer
+            // waits for the host to look them up
+            ggml_tensor * observed = ggml_cont(ctx0, ids);
+            ggml_set_output(observed);
+            cb(observed, LLAMA_MOE_CACHE_OBSERVED, il);
+            ggml_build_forward_expand(gf, observed);
 
             const int64_t n_used   = selected_experts->ne[0];
             const int64_t n_tokens = selected_experts->ne[1];

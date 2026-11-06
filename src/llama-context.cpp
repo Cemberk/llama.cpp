@@ -2996,6 +2996,12 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+    // hybrid MoE cache: one wait per step for the selected experts, instead of one per layer
+    if (status == GGML_STATUS_SUCCESS && moe_cache && moe_cache->hybrid()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->observe(gf);
+    }
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
@@ -4293,7 +4299,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_trace             =*/ nullptr,
         /*.moe_cache_profile           =*/ nullptr,
-        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_SLRU,
+        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_NEXT,
         /*.moe_cache_hybrid            =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

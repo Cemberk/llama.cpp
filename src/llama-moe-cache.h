@@ -10,11 +10,14 @@
 
 struct llama_model;
 
+// name of the tensors holding the experts a hybrid layer selected, "<name>-<il>", read after each step
+#define LLAMA_MOE_CACHE_OBSERVED "moe_cache_observed"
+
 struct llama_moe_cache_options {
     size_t size = 0;      // device bytes for the cache
     std::string trace;    // file the experts selected in cached layers are appended to, empty = off
     std::string profile;  // file of expert usage, read at start (warm start) and written at the end, empty = off
-    enum llama_moe_cache_policy policy = LLAMA_MOE_CACHE_POLICY_SLRU;
+    enum llama_moe_cache_policy policy = LLAMA_MOE_CACHE_POLICY_NEXT;
     bool hybrid = false;  // small ubatches: misses are computed on the CPU instead of uploaded
 };
 
@@ -38,6 +41,10 @@ public:
 
     // hybrid mode: whether it is on
     bool hybrid() const;
+
+    // hybrid mode: after a step has finished, learn from the experts its layers selected (the LLAMA_MOE_CACHE_OBSERVED
+    // tensors of graph): promote the hits, count, admit the most used misses, trace
+    void observe(ggml_cgraph * graph);
 
     // hybrid mode: the map of layer il, F32 [3, n_expert] in host memory, per expert:
     // the slot to read on the device (the zero expert for a miss), the expert to compute on the CPU

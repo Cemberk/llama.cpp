@@ -2750,7 +2750,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-cache-policy"}, "{slru,lfu,next}",
-        "which expert the MoE cache evicts: slru, the least recently used; lfu, the least used with counts that decay; or next, the one whose next use is expected furthest away, from where its layer comes in the pass and how often it is used (default: slru)",
+        "which expert the MoE cache evicts: slru, the least recently used; lfu, the least used with counts that decay; or next, the one whose next use is expected furthest away, from where its layer comes in the pass and how often it is used (default: next)",
         [](common_params & params, const std::string & value) {
             if (value == "slru") {
                 params.moe_cache_policy = LLAMA_MOE_CACHE_POLICY_SLRU;
