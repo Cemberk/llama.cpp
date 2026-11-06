@@ -335,6 +335,22 @@ def skew(steps: list) -> list:
     return lines
 
 
+def write_synthetic(path: str, layers: int = 40, experts: int = 256, used: int = 8, tokens: int = 400, seed: int = 1) -> None:
+    """A trace whose experts follow a Zipf-like popularity, independently per
+    token: no temporal locality, so it compares policies on frequency alone."""
+    import random
+
+    rng = random.Random(seed)
+    weights = [1.0 / (i + 1) ** 0.9 for i in range(experts)]
+    with open(path, "w", encoding="utf8") as f:
+        for _ in range(tokens):
+            for layer in range(layers):
+                chosen = set()
+                while len(chosen) < used:
+                    chosen.add(rng.choices(range(experts), weights)[0])
+                f.write(f"{layer} 1 " + " ".join(map(str, sorted(chosen))) + "\n")
+
+
 def self_test() -> None:
     # Two layers; a hot set of 4 experts and a cold tail.
     import random
@@ -366,11 +382,20 @@ def main(argv: list) -> int:
     parser.add_argument("--pin-share", type=float, default=0.5, help="share of the slots the warm policy preloads (default 0.5, as the engine)")
     parser.add_argument("--expert-bytes", type=int, help="bytes of one expert (all tensors), to report the uploads")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="write a synthetic trace (40 layers, 256 experts, 8 per token, 400 tokens) to TRACE first",
+    )
     args = parser.parse_args(argv)
 
     if args.self_test:
         self_test()
         return 0
+    if args.synthetic:
+        if not args.trace:
+            parser.error("--synthetic needs a TRACE path to write")
+        write_synthetic(args.trace)
     if not args.trace:
         parser.error("a trace is required")
 
