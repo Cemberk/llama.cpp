@@ -407,6 +407,7 @@ extern "C" {
         const char * moe_cache_trace; // file the experts selected in cached layers are appended to, one line per layer and ubatch, NULL = off [EXPERIMENTAL]
         const char * moe_cache_profile; // file of expert usage: read at start to fill the cache with the most used experts, written back at the end, NULL = off [EXPERIMENTAL]
         enum llama_moe_cache_policy moe_cache_policy; // [EXPERIMENTAL]
+        bool moe_cache_hybrid; // small ubatches: compute the cached experts on the device and the others on the CPU from host memory, instead of uploading them [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

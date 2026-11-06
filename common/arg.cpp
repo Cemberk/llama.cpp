@@ -2762,6 +2762,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-cache-hybrid"},
+        "for ubatches of up to 16 tokens, compute the experts in the MoE cache on the GPU and the missing ones on the CPU from host memory, instead of uploading them first; frequently used misses are admitted to the cache in the background (default: off)",
+        [](common_params & params) {
+            params.moe_cache_hybrid = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -1237,6 +1237,21 @@ struct llm_graph_context {
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
+    // how the experts of a layer are read: from the MoE cache at `slots`, and in hybrid mode partly on the CPU
+    struct moe_cache_lookup {
+        ggml_tensor * slots   = nullptr; // [n_expert_used, n_tokens] slots in the cache, nullptr if not cached
+        ggml_tensor * cpu_ids = nullptr; // hybrid: [n_expert_used, n_tokens] the experts the CPU computes
+        ggml_tensor * miss    = nullptr; // hybrid: [1, n_expert_used, n_tokens] 1 where the CPU's result counts
+    };
+
+    moe_cache_lookup build_moe_cache_lookup(
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+                     int   il) const;
+
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,

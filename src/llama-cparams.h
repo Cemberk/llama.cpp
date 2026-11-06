@@ -64,6 +64,7 @@ struct llama_cparams {
     std::string moe_cache_trace;
     std::string moe_cache_profile;
     enum llama_moe_cache_policy moe_cache_policy;
+    bool moe_cache_hybrid;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

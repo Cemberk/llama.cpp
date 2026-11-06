@@ -134,6 +134,54 @@ struct moe_cache_slru {
         int32_t slot;
     };
 
+    // hybrid mode: promote the hits of a layer lookup and list its misses, without giving them slots
+    size_t lookup(int32_t il, const int32_t * ids, size_t n_ids, std::vector<int32_t> & misses) {
+        misses.clear();
+        if (++seen_gen == 0) {
+            std::fill(seen.begin(), seen.end(), 0);
+            seen_gen = 1;
+        }
+        uniq.clear();
+        for (size_t i = 0; i < n_ids; ++i) {
+            GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
+            if (seen[ids[i]] != seen_gen) {
+                seen[ids[i]] = seen_gen;
+                uniq.push_back(ids[i]);
+            }
+        }
+        for (int32_t e : uniq) {
+            score[(size_t) il*n_expert + e] += 1.0f;
+        }
+        if (++n_plans % decay_every == 0) {
+            for (float & x : score) {
+                x *= 0.5f;
+            }
+        }
+        size_t n_hit = 0;
+        int32_t * slots = slot_map[il];
+        for (int32_t e : uniq) {
+            if (slots[e] >= 0) {
+                touch(slots[e]);
+                n_hit++;
+            } else {
+                misses.push_back(e);
+            }
+        }
+        return n_hit;
+    }
+
+    // hybrid mode: give expert e of layer il a slot after a lookup of il, evicting as plan() does
+    int32_t admit(int32_t il, int32_t e) {
+        const int32_t s = victim(il);
+        if (key_of[s] >= 0) {
+            slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+        }
+        key_of[s] = il*n_expert + e;
+        slot_map[il][e] = s;
+        move(s, false);
+        return s;
+    }
+
     struct warm_fill {
         int32_t il;
         int32_t expert;
@@ -293,6 +341,7 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * hybrid_map = nullptr; // hybrid mode: F32 [3, n_expert] in host memory, see get_hybrid_map
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
     };
 
@@ -320,7 +369,22 @@ struct llama_moe_cache::impl {
     std::vector<group> groups;
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
-    std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
+    std::unordered_map<const ggml_tensor *, int32_t> layer_of;  // slot map -> layer
+    std::unordered_map<const ggml_tensor *, int32_t> hybrid_of; // hybrid map -> layer
+
+    // hybrid mode: misses are computed on the CPU; the most used are admitted to the cache, uploaded on the next lookup
+    // of their group, before any kernel reads them
+    bool hybrid = false;
+    static constexpr int64_t max_batch_hybrid = 16;     // larger ubatches would be offloaded to the GPU whole
+    static constexpr size_t  admit_per_lookup = 2;      // misses admitted per layer and ubatch
+    static constexpr float   admit_min_score  = 2.0f;   // decayed selections an expert needs to be admitted
+    struct pending_upload {
+        int32_t il;
+        int32_t expert;
+        int32_t slot;
+    };
+    std::vector<std::vector<pending_upload>> pending; // [group]
+    std::vector<int32_t> misses;
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
@@ -343,6 +407,7 @@ struct llama_moe_cache::impl {
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         const size_t size = options.size;
         const std::string & trace_path = options.trace;
+        hybrid = options.hybrid;
         if (!no_alloc) {
             profile = options.profile;
         }
@@ -404,7 +469,7 @@ struct llama_moe_cache::impl {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
+                res += GGML_PAD(t->nb[2]*(n_slots + 1 + (hybrid ? 1 : 0)), alignment);
             }
             return res;
         };
@@ -458,7 +523,7 @@ struct llama_moe_cache::impl {
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
             g.slru.lfu = options.policy == LLAMA_MOE_CACHE_POLICY_LFU;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size();
+            n_tensors_host  += g.layers.size()*(hybrid ? 2 : 1);
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -494,7 +559,8 @@ struct llama_moe_cache::impl {
             }
             ggml_context * ctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
+                // the slots, the zero expert of hybrid mode, then one more, as CUDA MMQ can read past the last expert
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1 + (hybrid ? 1 : 0));
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -505,7 +571,7 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + (hybrid ? 1 : 0), bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -513,6 +579,12 @@ struct llama_moe_cache::impl {
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
                 layer_of[l.slot_map] = il;
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                if (hybrid) {
+                    l.hybrid_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_F32, 3, g.ref[0]->ne[2]);
+                    ggml_format_name(l.hybrid_map, "moe_cache.hybrid_map-%d", il);
+                    hybrid_of[l.hybrid_map] = il;
+                    buf_host_size += GGML_PAD(ggml_nbytes(l.hybrid_map), alignment_host);
+                }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -689,6 +761,40 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
+    ggml_tensor * get_hybrid_map(int32_t il, int64_t n_tokens, int64_t /*n_expert_used*/) const {
+        if (!hybrid || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il].hybrid_map == nullptr) {
+            return nullptr;
+        }
+        if (n_tokens == 0 || n_tokens > max_batch_hybrid || groups[layers[il].ig].n_slots == 0) {
+            return nullptr;
+        }
+        return layers[il].hybrid_map;
+    }
+
+    // enqueue the uploads admitted since the last lookup of group ig, before anything reads their slots
+    void flush_pending(ggml_backend_t backend, int32_t ig) {
+        if (pending.empty() || pending[ig].empty()) {
+            return;
+        }
+        group & g = groups[ig];
+        size_t bytes = 0;
+        for (const pending_upload & p : pending[ig]) {
+            // a slot evicted again before its upload holds another expert now; its own upload follows
+            if (g.slru.key_of[p.slot] != p.il*g.slru.n_expert + p.expert) {
+                continue;
+            }
+            const layer & l = layers[p.il];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                const size_t expert_size = w->nb[2];
+                ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + p.expert*expert_size, p.slot*expert_size, expert_size);
+                bytes += expert_size;
+            }
+        }
+        pending[ig].clear();
+        stats_small.bytes += bytes;
+    }
+
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -699,6 +805,7 @@ struct llama_moe_cache::impl {
         if (backend != devices[g.id].backend) {
             return 0;
         }
+        flush_pending(backend, layers[b.il].ig);
 
         // large batches only read the cache, so the experts used in generation stay in it
         const int32_t * slots = g.slru.slot_map[b.il];
@@ -724,7 +831,108 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // read the experts selected in layer il, which the get_rows reading dst looks up, into ids
+    const ggml_tensor * read_selected(ggml_backend_t backend, const ggml_tensor * dst, ggml_cgraph * graph, int32_t il) {
+        // the get_rows that looks up the slots of the selected experts
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        const ggml_tensor * lookup = nullptr;
+        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                lookup = node;
+            }
+        }
+        GGML_ASSERT(lookup != nullptr);
+
+        // the selected experts must be computed in an earlier split
+        const ggml_tensor * sel = lookup->src[1];
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == sel || node == sel->view_src) {
+                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+            }
+        }
+        GGML_ASSERT(ggml_is_contiguous(sel));
+
+        ids.resize(ggml_nelements(sel));
+        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        ggml_backend_synchronize(backend);
+        return sel;
+    }
+
+    void trace_selected(int32_t il, int64_t n_tokens) {
+        if (trace != nullptr) {
+            std::fprintf(trace, "%d %lld", il, (long long) n_tokens);
+            for (int32_t id : ids) {
+                std::fprintf(trace, " %d", id);
+            }
+            std::fputc('\n', trace);
+        }
+    }
+
+    // hybrid mode: hits read their slots, misses the zero expert on the device and are computed on the CPU
+    bool copy_hybrid(ggml_backend_t backend, int32_t il, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+        GGML_ASSERT(backend == devices[g.id].backend);
+
+        flush_pending(backend, l.ig);
+
+        const ggml_tensor * sel = read_selected(backend, dst, graph, il);
+        trace_selected(il, sel->ne[1]);
+
+        const size_t n_hit = g.slru.lookup(il, ids.data(), ids.size(), misses);
+
+        // the map: every expert reads the zero expert on the device and is not computed on the CPU, then the
+        // selected ones are set; the CPU computes the hits of the ubatch as one expert it reads anyway
+        const int32_t n_expert = g.slru.n_expert;
+        const int32_t * slots  = g.slru.slot_map[il];
+        const float zero_slot  = (float) g.n_slots;
+        const float redirect   = (float) (misses.empty() ? ids[0] : misses[0]);
+        float * map = (float *) l.hybrid_map->data;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            map[3*e + 0] = zero_slot;
+            map[3*e + 1] = redirect;
+            map[3*e + 2] = 0.0f;
+        }
+        for (int32_t id : ids) {
+            if (slots[id] >= 0) {
+                map[3*id + 0] = (float) slots[id];
+            } else {
+                map[3*id + 1] = (float) id;
+                map[3*id + 2] = 1.0f;
+            }
+        }
+
+        // admit the most used misses; they are uploaded before the next lookup of the group reads them
+        if (!misses.empty()) {
+            const float * score = g.slru.score.data();
+            std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                return score[(size_t) il*n_expert + a] > score[(size_t) il*n_expert + b];
+            });
+            if (pending.empty()) {
+                pending.resize(groups.size());
+            }
+            for (size_t i = 0; i < misses.size() && i < admit_per_lookup; ++i) {
+                if (score[(size_t) il*n_expert + misses[i]] < admit_min_score) {
+                    break;
+                }
+                pending[l.ig].push_back({ il, misses[i], g.slru.admit(il, misses[i]) });
+            }
+        }
+
+        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits   += n_hit;
+        st.misses += misses.size();
+
+        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        return true;
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (const auto ih = hybrid_of.find(src); ih != hybrid_of.end()) {
+            return copy_hybrid(backend, ih->second, src, dst, graph);
+        }
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -734,6 +942,9 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        // uploads admitted in hybrid mode go first, so this upload is the last to write its slots
+        flush_pending(backend, l.ig);
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -854,6 +1065,14 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+bool llama_moe_cache::hybrid() const {
+    return pimpl->hybrid;
+}
+
+ggml_tensor * llama_moe_cache::get_hybrid_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_hybrid_map(il, n_tokens, n_expert_used);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
