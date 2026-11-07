@@ -245,6 +245,48 @@ class NextUse(Policy):
         return misses
 
 
+class Hybrid(NextUse):
+    """--moe-cache-hybrid: a miss is computed on the CPU instead of uploaded;
+    after each lookup, at most `admit` of its misses whose decayed count is at
+    least `min_score` are admitted (uploaded), most used first, evicting by
+    the next rule. Admitted experts are ready the next time their layer runs,
+    which in a trace replay is the next lookup of that layer."""
+
+    def __init__(self, slots: int, layers: list, admit: int = 0, min_score: float = 1.0, used: int = 8):
+        super().__init__(slots, layers)
+        # 0: as the engine, about twice the cache's share of one token's selections, from 1 to 8
+        if admit <= 0:
+            admit = min(8, max(1, round(2.0 * slots / (len(layers) * used))))
+        self.admit = admit
+        self.min_score = min_score
+        self.name = f"hybrid {admit}/{min_score:g}"
+        self.uploads = 0
+
+    def access(self, keys: list, index: int) -> int:
+        for key in keys:
+            self.score[key] += 1.0
+        self.steps += 1
+        if self.steps % self.decay_every == 0:
+            for key in self.score:
+                self.score[key] *= 0.5
+        current = set(keys)
+        layer_pos = self.position[keys[0][0]] if keys else 0
+        missed = [key for key in keys if key not in self.cached]
+        missed.sort(key=lambda k: self.score[k], reverse=True)
+        for key in missed[: self.admit]:
+            if self.score[key] < self.min_score:
+                break
+            if len(self.cached) >= self.slots:
+                candidates = [k for k in self.cached if k not in current]
+                if not candidates:
+                    break
+                victim = max(candidates, key=lambda k: self.expected_next_use(k, layer_pos))
+                self.cached.remove(victim)
+            self.cached.add(key)
+            self.uploads += 1
+        return len(missed)
+
+
 class Belady(Policy):
     """Offline optimum: needs the whole trace up front."""
 
@@ -305,6 +347,7 @@ class Result:
     misses: int = 0
     selections: int = 0
     tokens: int = 0
+    uploads: int = 0  # experts written to the cache: every miss, or the admitted ones in hybrid mode
 
 
 def simulate(steps: list, policies: list) -> list:
@@ -316,6 +359,7 @@ def simulate(steps: list, policies: list) -> list:
             result.misses += policy.access(keys, index)
             result.selections += len(keys)
         result.tokens = sum(s.tokens for s in steps) // max(1, len({s.layer for s in steps}))
+        result.uploads = getattr(policy, "uploads", result.misses)
         results.append(result)
     return results
 
@@ -383,6 +427,11 @@ def main(argv: list) -> int:
     parser.add_argument("--expert-bytes", type=int, help="bytes of one expert (all tensors), to report the uploads")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
+        "--hybrid-sweep",
+        action="store_true",
+        help="compare hybrid mode's admission settings (misses admitted per lookup, minimum count) instead",
+    )
+    parser.add_argument(
         "--synthetic",
         action="store_true",
         help="write a synthetic trace (40 layers, 256 experts, 8 per token, 400 tokens) to TRACE first",
@@ -412,7 +461,21 @@ def main(argv: list) -> int:
         return 1
 
     trace_keys = [unique(step) for step in steps]
-    policies = [SLRU(slots), LRU(slots), LFU(slots), NextUse(slots, layers)]
+    if args.hybrid_sweep:
+        sweep = [NextUse(slots, layers)]
+        for admit in (1, 2, 4, 8, 1000):
+            for min_score in (0.0, 1.0, 2.0, 4.0):
+                sweep.append(Hybrid(slots, layers, admit, min_score))
+        print(f"{len(steps)} steps, {slots} slots; hybrid admit/min count, against next uploading every miss")
+        print(f"{'policy':16} {'hit rate':>9} {'uploads/token':>14}")
+        for r in simulate(steps, sweep):
+            hit = 1.0 - r.misses / r.selections if r.selections else 0.0
+            print(f"{r.name:16} {100 * hit:8.2f}% {r.uploads / max(1, r.tokens):14.2f}")
+        return 0
+    # experts per token: the most common count (traces from before the token count was fixed record 1 token for
+    # every ubatch)
+    used = collections.Counter(len(s.experts) // max(1, s.tokens) for s in steps).most_common(1)[0][0]
+    policies = [SLRU(slots), LRU(slots), LFU(slots), NextUse(slots, layers), Hybrid(slots, layers, used=used)]
     if args.profile:
         policies.append(SLRU(slots, preload=profile_pins(args.profile, slots, args.pin_share)))
         policies[-1].name = "warm"
@@ -426,7 +489,7 @@ def main(argv: list) -> int:
     for r in simulate(steps, policies):
         hit = 1.0 - r.misses / r.selections if r.selections else 0.0
         per_token = r.misses / r.tokens if r.tokens else 0.0
-        line = f"{r.name:8} {100 * hit:8.2f}% {r.misses:10d} {per_token:13.2f}"
+        line = f"{r.name:8} {100 * hit:8.2f}% {r.misses:10d} {per_token:13.2f}  uploads/token {r.uploads / max(1, r.tokens):.2f}"
         if args.expert_bytes:
             line += f"  {r.misses * args.expert_bytes / 2**30:8.2f} GiB"
         print(line)

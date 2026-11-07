@@ -398,6 +398,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        int32_t admit   = 1; // hybrid mode: misses admitted per layer and ubatch
         moe_cache_slru slru;
     };
 
@@ -439,8 +440,10 @@ struct llama_moe_cache::impl {
     // of their group, before any kernel reads them
     bool hybrid = false;
     static constexpr int64_t max_batch_hybrid = 16;     // larger ubatches would be offloaded to the GPU whole
-    static constexpr size_t  admit_per_lookup = 2;      // misses admitted per layer and ubatch
-    static constexpr float   admit_min_score  = 2.0f;   // decayed selections an expert needs to be admitted
+    // misses admitted per layer and ubatch: about twice the cache's share of one token's selections, from 1 to 8;
+    // in trace replays (OLMoE, 70 to 280 slots) fewer admissions hit as often on a small cache with far fewer
+    // uploads, and more pay on a large one; a minimum count only lost hits
+    static constexpr float   admit_min_score  = 1.0f;
     struct pending_upload {
         int32_t il;
         int32_t expert;
@@ -599,6 +602,10 @@ struct llama_moe_cache::impl {
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
             g.slru.policy = options.policy;
             g.slru.set_layers(g.layers);
+            {
+                const double per_token = (double) g.layers.size()*n_expert_used;
+                g.admit = std::clamp((int32_t) std::lround(2.0*g.n_slots/per_token), 1, 8);
+            }
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(hybrid ? 2 : 1);
         }
@@ -1019,7 +1026,7 @@ struct llama_moe_cache::impl {
                 return score[(size_t) il*n_expert + a] > score[(size_t) il*n_expert + b];
             });
             const size_t n_miss = misses.size();
-            for (size_t i = 0; i < misses.size() && i < admit_per_lookup; ++i) {
+            for (size_t i = 0; i < misses.size() && i < (size_t) g.admit; ++i) {
                 if (score[(size_t) il*n_expert + misses[i]] < admit_min_score) {
                     break;
                 }
@@ -1100,7 +1107,7 @@ struct llama_moe_cache::impl {
         }
 
         if (trace != nullptr) {
-            std::fprintf(trace, "%d %lld", il, (long long) sel->ne[1]);
+            std::fprintf(trace, "%d %lld", il, (long long) (ggml_nelements(sel) / std::max<int64_t>(1, n_expert_used)));
             for (int32_t id : ids) {
                 std::fprintf(trace, " %d", id);
             }
