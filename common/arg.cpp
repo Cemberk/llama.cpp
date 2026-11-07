@@ -3627,6 +3627,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_PROPS"));
     add_opt(common_arg(
+        {"--exit-with-parent"},
+        "exit when stdin reaches end of file: the parent keeps a pipe open on it, so the server never outlives the program that started it (default: off)",
+        [](common_params & params) {
+            params.exit_with_parent = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slots"},
         {"--no-slots"},
         string_format("expose slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled"),

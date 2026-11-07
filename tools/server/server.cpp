@@ -23,6 +23,8 @@
 #include <windows.h>
 #endif
 
+#include "exit-with-parent.h"
+
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
@@ -793,6 +795,15 @@ int llama_server(int argc, char ** argv) {
     }
 
     SRV_INF("%s", "initializing ...\n");
+
+    // before loading the model, so a parent that dies while it loads frees it too
+    if (params.exit_with_parent) {
+        common_exit_with_parent([]() {
+            if (!is_terminating.test_and_set() && shutdown_handler) {
+                shutdown_handler(0);
+            }
+        });
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);

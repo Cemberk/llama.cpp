@@ -690,6 +690,7 @@ struct common_params {
 
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
+    bool exit_with_parent = false; // exit when stdin (a pipe from the parent) closes
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 

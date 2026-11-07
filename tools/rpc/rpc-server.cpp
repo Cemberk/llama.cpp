@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
+#include "../../common/exit-with-parent.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  include <windows.h>
@@ -81,6 +82,7 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    bool                     exit_with_parent = false;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -92,6 +94,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  --exit-with-parent               exit when stdin (a pipe from the parent) closes\n");
     fprintf(stderr, "\n");
 }
 
@@ -139,6 +142,8 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--exit-with-parent") {
+            params.exit_with_parent = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -203,6 +208,11 @@ int main(int argc, char * argv[]) {
     if (!rpc_server_params_parse(argc, argv, params)) {
         fprintf(stderr, "Invalid parameters\n");
         return 1;
+    }
+
+    if (params.exit_with_parent) {
+        // the server loop has no shutdown: exit at once
+        common_exit_with_parent(nullptr);
     }
 
     if (params.host != "127.0.0.1") {
