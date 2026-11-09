@@ -1264,10 +1264,20 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
+    // the MoE cache's banks are allocated after the fit, on the GPUs: leave
+    // room for them on each device, or the fit fills VRAM and a later
+    // allocation fails mid-request (seen on an 8 GB RTX 3070 Ti)
+    std::vector<size_t> fit_targets = params.fit_params_target;
+    if (params.moe_cache_size > 0) {
+        for (auto & target : fit_targets) {
+            target += params.moe_cache_size;
+        }
+    }
+
     common_fit_params(params.model.path.c_str(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
-        params.fit_params_target.data(),
+        fit_targets.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
